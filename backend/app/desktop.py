@@ -10,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable
 
+import librosa
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -56,6 +57,7 @@ class LiveMicTranscriber:
         on_text: Callable[[str], None],
         on_status: Callable[[str], None],
         on_level: Callable[[float], None] | None = None,
+        on_audio_snapshot: Callable[[np.ndarray, int], None] | None = None,
         chunk_seconds: float = 1.4,
         sample_rate: int = 16000,
         language: str | None = "ko",
@@ -70,6 +72,7 @@ class LiveMicTranscriber:
         self.on_text = on_text
         self.on_status = on_status
         self.on_level = on_level
+        self.on_audio_snapshot = on_audio_snapshot
         self.chunk_seconds = chunk_seconds
         self.sample_rate = sample_rate
         self.language = language
@@ -138,6 +141,12 @@ class LiveMicTranscriber:
             if buffered_seconds > self.chunk_seconds * 2.2:
                 buffered = buffered[-int(self.sample_rate * self.chunk_seconds * 2.2) :]
 
+            if self.on_audio_snapshot is not None:
+                try:
+                    self.on_audio_snapshot(buffered.squeeze().astype(np.float32), self.sample_rate)
+                except Exception:
+                    pass
+
             text = self._transcribe_chunk(buffered)
             buffered = buffered[-int(self.sample_rate * 0.65) :]
 
@@ -193,8 +202,9 @@ class LiveMicTranscriber:
         peak = float(np.max(np.abs(mono)))
         rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-8)
 
-        # Lower gate threshold so quieter speech is still forwarded to Whisper.
-        if peak < self.gate_peak_threshold or rms < self.gate_rms_threshold:
+        # Gate only when both peak and rms are too low.
+        # This is more tolerant to quieter but intelligible speech.
+        if peak < self.gate_peak_threshold and rms < self.gate_rms_threshold:
             return None
 
         target_peak = 0.92
@@ -361,6 +371,211 @@ class SubtitleWindow:
         return ImageFont.load_default()
 
 
+class AudioDebugWindow:
+    def __init__(self, root: tk.Tk) -> None:
+        self.window = tk.Toplevel(root)
+        self.window.title("Audio Debug View")
+        self.window.geometry("980x560+200+120")
+        self.window.configure(bg="#111214")
+        self.is_visible = False
+        self.photo_image: ImageTk.PhotoImage | None = None
+        self.gate_history: list[bool] = []
+
+        self.info_var = tk.StringVar(value="마이크 입력 대기 중")
+        self.info_label = tk.Label(
+            self.window,
+            textvariable=self.info_var,
+            bg="#111214",
+            fg="#aab0b7",
+            anchor="w",
+            justify="left",
+            padx=12,
+            pady=8,
+            font=("Helvetica", 10),
+        )
+        self.info_label.pack(fill="x")
+
+        self.canvas = tk.Canvas(
+            self.window,
+            bg="#0d0e10",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.canvas_image = self.canvas.create_image(0, 0, anchor="nw")
+        self.window.bind("<Configure>", lambda _event: self._render_placeholder())
+        self.window.protocol("WM_DELETE_WINDOW", self.hide)
+        self.hide()
+
+    def show(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.after(180, lambda: self.window.attributes("-topmost", False))
+        self.is_visible = True
+        self._render_placeholder()
+
+    def hide(self) -> None:
+        self.window.withdraw()
+        self.is_visible = False
+
+    def reset(self) -> None:
+        self.info_var.set("마이크 입력 대기 중")
+        if self.is_visible:
+            self._render_placeholder()
+
+    def update_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        gate_peak_threshold: float,
+        gate_rms_threshold: float,
+    ) -> None:
+        if not self.is_visible:
+            return
+
+        mono = audio.astype(np.float32).reshape(-1)
+        if mono.size < 32:
+            return
+
+        peak = float(np.max(np.abs(mono)) + 1e-8)
+        rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-8)
+        gate_pass = peak >= gate_peak_threshold and rms >= gate_rms_threshold
+        gate_state = "PASS" if gate_pass else "BLOCK"
+        self.gate_history.append(gate_pass)
+        if len(self.gate_history) > 22:
+            self.gate_history = self.gate_history[-22:]
+        pass_ratio = (sum(self.gate_history) / len(self.gate_history)) if self.gate_history else 0.0
+        tuning_hint = "입력 안정"
+        if pass_ratio < 0.25 and rms < gate_rms_threshold * 0.9:
+            tuning_hint = "민감도 올림 권장"
+        elif peak > 0.98:
+            tuning_hint = "입력 과다, 민감도 내림 권장"
+        duration = mono.size / max(sample_rate, 1)
+        self.info_var.set(
+            "duration={:.2f}s  peak={:.4f} (th {:.4f})  rms={:.4f} (th {:.4f})  gate={}  pass_ratio={:.0f}%  hint={}".format(
+                duration,
+                peak,
+                gate_peak_threshold,
+                rms,
+                gate_rms_threshold,
+                gate_state,
+                pass_ratio * 100.0,
+                tuning_hint,
+            )
+        )
+        self._render_audio_image(mono, sample_rate)
+
+    def _render_placeholder(self) -> None:
+        if not self.is_visible:
+            return
+        width = max(self.canvas.winfo_width(), 320)
+        height = max(self.canvas.winfo_height(), 220)
+        image = Image.new("RGB", (width, height), "#0d0e10")
+        draw = ImageDraw.Draw(image)
+        draw.text((20, 20), "Waveform / Spectrogram / Mel Spectrogram", fill="#aab0b7")
+        draw.text((20, 46), "실시간 인식을 시작하면 입력 오디오가 시각화됩니다.", fill="#80858c")
+        self.photo_image = ImageTk.PhotoImage(image)
+        self.canvas.itemconfigure(self.canvas_image, image=self.photo_image)
+        self.canvas.coords(self.canvas_image, 0, 0)
+
+    def _render_audio_image(self, audio: np.ndarray, sample_rate: int) -> None:
+        width = max(self.canvas.winfo_width(), 320)
+        height = max(self.canvas.winfo_height(), 220)
+        image = Image.new("RGB", (width, height), "#0d0e10")
+        draw = ImageDraw.Draw(image)
+
+        margin = 12
+        row_gap = 10
+        row_height = int((height - (margin * 2) - (row_gap * 2)) / 3)
+        row_width = width - (margin * 2)
+        if row_height < 32 or row_width < 40:
+            self.photo_image = ImageTk.PhotoImage(image)
+            self.canvas.itemconfigure(self.canvas_image, image=self.photo_image)
+            self.canvas.coords(self.canvas_image, 0, 0)
+            return
+
+        rows = []
+        for index in range(3):
+            y0 = margin + index * (row_height + row_gap)
+            y1 = y0 + row_height
+            rows.append((margin, y0, margin + row_width, y1))
+
+        self._draw_waveform(draw, audio, rows[0])
+        self._draw_spectrogram(image, audio, sample_rate, rows[1], mel=False)
+        self._draw_spectrogram(image, audio, sample_rate, rows[2], mel=True)
+        draw.text((rows[0][0] + 8, rows[0][1] + 8), "Waveform", fill="#cfd3d8")
+        draw.text((rows[1][0] + 8, rows[1][1] + 8), "Spectrogram", fill="#cfd3d8")
+        draw.text((rows[2][0] + 8, rows[2][1] + 8), "Mel Spectrogram", fill="#cfd3d8")
+
+        self.photo_image = ImageTk.PhotoImage(image)
+        self.canvas.itemconfigure(self.canvas_image, image=self.photo_image)
+        self.canvas.coords(self.canvas_image, 0, 0)
+
+    def _draw_waveform(self, draw: ImageDraw.ImageDraw, audio: np.ndarray, rect: tuple[int, int, int, int]) -> None:
+        x0, y0, x1, y1 = rect
+        draw.rectangle((x0, y0, x1, y1), fill="#14161a", outline="#23262c", width=1)
+        mid_y = int((y0 + y1) / 2)
+        draw.line((x0, mid_y, x1, mid_y), fill="#2f333a", width=1)
+
+        width = max(x1 - x0 - 2, 1)
+        indices = np.linspace(0, len(audio) - 1, width, dtype=np.int32)
+        sampled = audio[indices]
+        amp = np.clip(sampled, -1.0, 1.0)
+        points = []
+        half = max((y1 - y0 - 8) / 2.0, 1.0)
+        for idx, value in enumerate(amp):
+            x = x0 + 1 + idx
+            y = mid_y - (value * half)
+            points.append((x, y))
+        if len(points) > 1:
+            draw.line(points, fill="#73c2fb", width=1)
+
+    def _draw_spectrogram(
+        self,
+        image: Image.Image,
+        audio: np.ndarray,
+        sample_rate: int,
+        rect: tuple[int, int, int, int],
+        mel: bool,
+    ) -> None:
+        x0, y0, x1, y1 = rect
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((x0, y0, x1, y1), fill="#14161a", outline="#23262c", width=1)
+
+        try:
+            n_fft = 512
+            hop = 160
+            if mel:
+                spec = librosa.feature.melspectrogram(
+                    y=audio,
+                    sr=sample_rate,
+                    n_fft=n_fft,
+                    hop_length=hop,
+                    n_mels=64,
+                    power=2.0,
+                )
+                db = librosa.power_to_db(spec, ref=np.max)
+            else:
+                stft = librosa.stft(y=audio, n_fft=n_fft, hop_length=hop)
+                magnitude = np.abs(stft)
+                db = librosa.amplitude_to_db(magnitude, ref=np.max)
+        except Exception:
+            return
+
+        db = np.nan_to_num(db, nan=-80.0, neginf=-80.0, posinf=0.0)
+        clipped = np.clip(db, -80.0, 0.0)
+        normalized = ((clipped + 80.0) / 80.0 * 255.0).astype(np.uint8)
+        # Flip vertically so lower frequencies are at the bottom.
+        normalized = normalized[::-1, :]
+
+        spec_img = Image.fromarray(normalized, mode="L").convert("RGB")
+        inner_width = max(x1 - x0 - 2, 1)
+        inner_height = max(y1 - y0 - 2, 1)
+        spec_img = spec_img.resize((inner_width, inner_height), Image.Resampling.BILINEAR)
+        image.paste(spec_img, (x0 + 1, y0 + 1))
+
+
 class TeleprompterDesktopApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -374,6 +589,7 @@ class TeleprompterDesktopApp:
         self.transcriber: LiveMicTranscriber | None = None
         self.monitor_stream: sd.InputStream | None = None
         self.level_queue: queue.Queue[float] = queue.Queue()
+        self.debug_audio_queue: queue.Queue[tuple[np.ndarray, int]] = queue.Queue(maxsize=4)
         self.devices: list[dict[str, object]] = []
         self.status_var = tk.StringVar(value="초기화 중입니다.")
         self.recognized_var = tk.StringVar(value=INITIAL_RECOGNIZED_MESSAGE)
@@ -386,7 +602,7 @@ class TeleprompterDesktopApp:
         self.subtitle_mirror_var = tk.BooleanVar(value=False)
         self.progress_window_var = tk.IntVar(value=260)
         self.confidence_var = tk.DoubleVar(value=0.22)
-        self.input_sensitivity_var = tk.DoubleVar(value=1.6)
+        self.input_sensitivity_var = tk.DoubleVar(value=1.8)
         self.input_sensitivity_display_var = tk.StringVar(value="")
         self.recognition_preset_var = tk.StringVar(value="균형")
         self.accuracy_priority_var = tk.BooleanVar(value=False)
@@ -399,6 +615,7 @@ class TeleprompterDesktopApp:
         self.is_listening = False
         self.auto_listen_on_device_select = True
         self.subtitle_window = SubtitleWindow(root)
+        self.audio_debug_window = AudioDebugWindow(root)
 
         self._build_ui()
         self.refresh_presentation_mirror_button()
@@ -410,6 +627,7 @@ class TeleprompterDesktopApp:
         self.refresh_devices()
         self.set_status(f"Whisper model={MODEL_SIZE}, device={get_runtime_device()}")
         self.root.after(50, self.process_level_queue)
+        self.root.after(120, self.process_debug_audio_queue)
         self._ensure_main_window_visible()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -835,6 +1053,13 @@ class TeleprompterDesktopApp:
         )
         self.listen_state_label.pack(fill="x", pady=(10, 0))
 
+        self.audio_debug_button = ttk.Button(
+            monitor_card,
+            text="오디오 디버그 창 열기",
+            command=self.toggle_audio_debug_window,
+        )
+        self.audio_debug_button.pack(fill="x", pady=(10, 0))
+
         self.status_label = tk.Label(
             monitor_card,
             textvariable=self.status_var,
@@ -980,6 +1205,17 @@ class TeleprompterDesktopApp:
         self.mark_button_action("프레젠테이션 종료")
         self.stop_presentation_mode()
 
+    def toggle_audio_debug_window(self) -> None:
+        if self.audio_debug_window.is_visible:
+            self.audio_debug_window.hide()
+            self.audio_debug_button.configure(text="오디오 디버그 창 열기")
+            self.mark_button_action("오디오 디버그 창 닫기")
+            return
+
+        self.audio_debug_window.show()
+        self.audio_debug_button.configure(text="오디오 디버그 창 닫기")
+        self.mark_button_action("오디오 디버그 창 열기")
+
     def toggle_presentation_mirror_button(self) -> None:
         self.subtitle_mirror_var.set(not self.subtitle_mirror_var.get())
         self.toggle_subtitle_mirror()
@@ -1016,8 +1252,9 @@ class TeleprompterDesktopApp:
 
     def get_gate_thresholds(self) -> tuple[float, float]:
         # Higher sensitivity lowers the gate so quieter speech passes through.
+        # Base thresholds are tuned to reduce under-detection in normal room voice.
         sensitivity = max(0.8, float(self.input_sensitivity_var.get()))
-        return 0.0025 / sensitivity, 0.0007 / sensitivity
+        return 0.0022 / sensitivity, 0.00062 / sensitivity
 
     def refresh_input_sensitivity_display(self) -> None:
         percent = int(round(float(self.input_sensitivity_var.get()) * 100))
@@ -1052,13 +1289,31 @@ class TeleprompterDesktopApp:
         self.set_status(f"우선 모드 적용: {mode} (beam={beam_size}, best_of={best_of})")
 
     def apply_speed_preset(self) -> None:
-        self.apply_recognition_preset("속도 우선", chunk_seconds=0.9, confidence=0.18, backtrack_chars=340)
+        self.apply_recognition_preset(
+            "속도 우선",
+            chunk_seconds=0.9,
+            confidence=0.18,
+            backtrack_chars=340,
+            sensitivity=1.95,
+        )
 
     def apply_balanced_preset(self) -> None:
-        self.apply_recognition_preset("균형", chunk_seconds=1.4, confidence=0.22, backtrack_chars=300)
+        self.apply_recognition_preset(
+            "균형",
+            chunk_seconds=1.4,
+            confidence=0.22,
+            backtrack_chars=300,
+            sensitivity=1.80,
+        )
 
     def apply_accuracy_preset(self) -> None:
-        self.apply_recognition_preset("정확도 우선", chunk_seconds=2.1, confidence=0.30, backtrack_chars=220)
+        self.apply_recognition_preset(
+            "정확도 우선",
+            chunk_seconds=2.1,
+            confidence=0.30,
+            backtrack_chars=220,
+            sensitivity=1.65,
+        )
 
     def apply_recognition_preset(
         self,
@@ -1066,11 +1321,15 @@ class TeleprompterDesktopApp:
         chunk_seconds: float,
         confidence: float,
         backtrack_chars: int,
+        sensitivity: float | None = None,
     ) -> None:
         self.recognition_preset_var.set(name)
         self.chunk_seconds_var.set(chunk_seconds)
         self.confidence_var.set(confidence)
         self.progress_window_var.set(backtrack_chars)
+        if sensitivity is not None:
+            self.input_sensitivity_var.set(sensitivity)
+            self.on_input_sensitivity_changed()
 
         if self.transcriber is not None:
             self.transcriber.chunk_seconds = max(float(self.chunk_seconds_var.get()), 0.8)
@@ -1078,7 +1337,12 @@ class TeleprompterDesktopApp:
 
         self.mark_button_action(f"프리셋: {name}")
         self.set_status(
-            f"인식 프리셋 적용: {name} (응답속도 {chunk_seconds:.1f}s, 민감도 {confidence:.2f})"
+            "인식 프리셋 적용: {} (응답속도 {:.1f}s, 매칭 민감도 {:.2f}, 입력 민감도 {:.0f}%)".format(
+                name,
+                chunk_seconds,
+                confidence,
+                float(self.input_sensitivity_var.get()) * 100.0,
+            )
         )
 
     def update_button_layout(self, panel_width: int) -> None:
@@ -1218,6 +1482,36 @@ class TeleprompterDesktopApp:
         if self.root.winfo_exists():
             self.root.after(50, self.process_level_queue)
 
+    def queue_debug_audio_update(self, audio: np.ndarray, sample_rate: int) -> None:
+        payload = (audio.astype(np.float32), int(sample_rate))
+        try:
+            self.debug_audio_queue.put_nowait(payload)
+        except queue.Full:
+            try:
+                self.debug_audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.debug_audio_queue.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    def process_debug_audio_queue(self) -> None:
+        latest_item: tuple[np.ndarray, int] | None = None
+        while True:
+            try:
+                latest_item = self.debug_audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest_item is not None:
+            audio, sample_rate = latest_item
+            gate_peak, gate_rms = self.get_gate_thresholds()
+            self.audio_debug_window.update_audio(audio, sample_rate, gate_peak, gate_rms)
+
+        if self.root.winfo_exists():
+            self.root.after(120, self.process_debug_audio_queue)
+
     def _sync_teleprompter_from_editor(self, _event=None) -> None:
         self.render_teleprompter("")
 
@@ -1294,6 +1588,7 @@ class TeleprompterDesktopApp:
                 device_id=int(selected["id"]),
                 sample_rate=sample_rate,
                 on_level=self.queue_level_update,
+                on_audio_snapshot=self.queue_debug_audio_update,
                 chunk_seconds=max(float(self.chunk_seconds_var.get()), 0.8),
                 language=None if self.language_var.get() == "auto" else self.language_var.get(),
                 beam_size=self.get_decoder_preferences()[0],
@@ -1333,6 +1628,7 @@ class TeleprompterDesktopApp:
         self.recognized_var.set("인식을 중지했습니다.")
         self.sync_subtitle_preview()
         self.start_level_monitor()
+        self.audio_debug_window.reset()
         self.is_listening = False
         self.refresh_listening_ui()
 
@@ -1538,6 +1834,7 @@ class TeleprompterDesktopApp:
             self.transcriber.stop()
             self.transcriber = None
         self.stop_level_monitor()
+        self.audio_debug_window.window.destroy()
         self.subtitle_window.window.destroy()
         self.root.destroy()
 
