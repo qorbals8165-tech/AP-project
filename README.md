@@ -55,6 +55,11 @@ setup_windows.bat
 - `backend` 가상환경 생성 및 `requirements.txt` 설치
 - `frontend` `npm install`
 
+추가 템플릿:
+
+- 로컬 개발용: `backend/.env.local.example`
+- 배포용: `backend/.env.prod.example`
+
 ### macOS / 수동 설치
 
 ```bash
@@ -128,7 +133,32 @@ TRANSFORMERS_WHISPER_MODEL_ID=ghost613/whisper-large-v3-turbo-korean
 
 # Comma-separated frontend origins
 BACKEND_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
+# Optional API key auth (set non-empty value to require X-API-Key header)
+BACKEND_API_KEY=
+BACKEND_REQUIRE_API_KEY=false
+
+# Per-IP request budget per minute (in-memory)
+BACKEND_RATE_LIMIT_PER_MINUTE=80
+BACKEND_RATE_LIMIT_MAX_CLIENTS=10000
+
+# Trust x-forwarded-for for client IP based rate limit (enable only behind trusted proxy)
+BACKEND_TRUST_PROXY_HEADERS=false
+
+# Maximum upload payload for /api/transcribe (MB)
+BACKEND_MAX_UPLOAD_MB=20
+
+# Expose model/device details on /api/health
+BACKEND_EXPOSE_HEALTH_DETAILS=false
 ```
+
+운영 프로필 권장:
+
+1. 로컬 테스트: `backend/.env.local.example` 기반 (`BACKEND_REQUIRE_API_KEY=false`)
+2. 배포 환경: `backend/.env.prod.example` 기반 (`BACKEND_REQUIRE_API_KEY=true`)
+3. Windows에서 수동 전환 시:
+`copy backend\\.env.local.example backend\\.env`
+`copy backend\\.env.prod.example backend\\.env`
 
 ### `frontend/.env`
 
@@ -138,10 +168,19 @@ VITE_API_BASE_URL=http://localhost:8000/api
 
 ## 7) API 개요
 
-- `GET /api/health`: 서비스 상태, 모델/디바이스 정보
+- `GET /api/health`: 서비스 상태 (`BACKEND_EXPOSE_HEALTH_DETAILS=true`일 때 모델/디바이스 포함)
 - `GET /api/settings/defaults`: UI 기본값 로드
 - `POST /api/transcribe`: 오디오 파일 전사
 - `POST /api/progress`: 인식 텍스트 기준 대본 진행 위치 추정
+
+배포 보안 권장:
+
+- 공개 배포 시 `BACKEND_API_KEY`를 설정하고 요청 헤더 `X-API-Key`를 사용하세요.
+- `BACKEND_REQUIRE_API_KEY=true`를 유지해 인증 누락 배포를 방지하세요.
+- `BACKEND_RATE_LIMIT_PER_MINUTE`, `BACKEND_RATE_LIMIT_MAX_CLIENTS`, `BACKEND_MAX_UPLOAD_MB`를 운영 환경에 맞춰 조정하세요.
+- 다중 인스턴스/로드밸런서 환경에서는 애플리케이션 내부 limiter만으로는 충분하지 않으므로, WAF/Nginx/Cloud LB 레벨 rate limit를 함께 사용하세요.
+- `BACKEND_TRUST_PROXY_HEADERS`는 신뢰 가능한 프록시 뒤에서만 `true`로 설정하세요.
+- `BACKEND_EXPOSE_HEALTH_DETAILS=false` 유지(기본값)로 런타임 정보 노출을 최소화하세요.
 
 ## 8) 스크린샷 & 데모
 

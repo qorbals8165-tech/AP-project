@@ -2,8 +2,8 @@ from pydantic import BaseModel, Field
 
 
 class ProgressRequest(BaseModel):
-    script: str = Field(..., min_length=1)
-    recognized_text: str = Field(..., min_length=1)
+    script: str = Field(..., min_length=1, max_length=120000)
+    recognized_text: str = Field(..., min_length=1, max_length=4000)
 
 
 class ProgressResponse(BaseModel):
