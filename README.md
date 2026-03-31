@@ -1,5 +1,10 @@
 # Voice Active Prompter
 
+[![Release](https://img.shields.io/github/v/tag/qorbals8165-tech/voice-active-prompter?label=release)](https://github.com/qorbals8165-tech/voice-active-prompter/tags)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/node-18%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-1f6feb)](https://github.com/qorbals8165-tech/voice-active-prompter)
+
 Whisper based AI teleprompter that advances scripts from live speech, supports microphone driven auto-progress, keyword jumps, auto-scroll, UI customization, and GPU acceleration when available.
 
 ## Features
@@ -37,6 +42,16 @@ cp frontend/.env.example frontend/.env
 
 4. Put sensitive values only in `.env` (never commit `.env`).
 5. Install backend/frontend dependencies and run.
+
+## Install Screenshots
+
+### Windows setup (`setup_windows.bat`)
+
+![Windows setup screenshot](docs/screenshots/windows-setup.svg)
+
+### Windows desktop run (`run_desktop.bat`)
+
+![Windows desktop run screenshot](docs/screenshots/windows-desktop-run.svg)
 
 ## Backend Run
 

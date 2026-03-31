@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#141f33"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="700" fill="url(#bg)"/>
+  <rect x="70" y="60" width="1060" height="580" rx="14" fill="#0a0f1a" stroke="#2d3b56" stroke-width="2"/>
+  <text x="100" y="110" fill="#c5d4f2" font-size="28" font-family="Consolas, 'Courier New', monospace">Windows Initial Setup</text>
+  <text x="100" y="155" fill="#9fb3d9" font-size="22" font-family="Consolas, 'Courier New', monospace">C:\voice-active-prompter&gt; setup_windows.bat</text>
+  <text x="100" y="205" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[1/7] project folders check...</text>
+  <text x="100" y="240" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[2/7] python check...</text>
+  <text x="100" y="275" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[3/7] npm check...</text>
+  <text x="100" y="310" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[4/7] create .env files...</text>
+  <text x="100" y="345" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[5/7] backend venv + pip install...</text>
+  <text x="100" y="380" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[6/7] frontend npm install...</text>
+  <text x="100" y="415" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[7/7] done</text>
+  <text x="100" y="470" fill="#e5eeff" font-size="22" font-family="Consolas, 'Courier New', monospace">run_backend.bat</text>
+  <text x="100" y="505" fill="#e5eeff" font-size="22" font-family="Consolas, 'Courier New', monospace">run_frontend.bat</text>
+  <text x="100" y="540" fill="#e5eeff" font-size="22" font-family="Consolas, 'Courier New', monospace">run_desktop.bat</text>
+  <text x="100" y="605" fill="#6fd3a3" font-size="20" font-family="Consolas, 'Courier New', monospace">Ready to use on Windows</text>
+</svg>
