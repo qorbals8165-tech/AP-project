@@ -143,7 +143,7 @@ class LiveMicTranscriber:
 
             if self.on_audio_snapshot is not None:
                 try:
-                    self.on_audio_snapshot(buffered.squeeze().astype(np.float32), self.sample_rate)
+                    self.on_audio_snapshot(buffered.squeeze(), self.sample_rate)
                 except Exception:
                     pass
 
@@ -380,6 +380,8 @@ class AudioDebugWindow:
         self.is_visible = False
         self.photo_image: ImageTk.PhotoImage | None = None
         self.gate_history: list[bool] = []
+        self.last_render_time = 0.0
+        self.min_render_interval = 0.65
 
         self.info_var = tk.StringVar(value="마이크 입력 대기 중")
         self.info_label = tk.Label(
@@ -433,10 +435,17 @@ class AudioDebugWindow:
     ) -> None:
         if not self.is_visible:
             return
+        now = time.monotonic()
+        if now - self.last_render_time < self.min_render_interval:
+            return
+        self.last_render_time = now
 
         mono = audio.astype(np.float32).reshape(-1)
         if mono.size < 32:
             return
+        max_samples = int(sample_rate * 1.2)
+        if mono.size > max_samples > 0:
+            mono = mono[-max_samples:]
 
         peak = float(np.max(np.abs(mono)) + 1e-8)
         rms = float(np.sqrt(np.mean(np.square(mono))) + 1e-8)
@@ -1483,6 +1492,8 @@ class TeleprompterDesktopApp:
             self.root.after(50, self.process_level_queue)
 
     def queue_debug_audio_update(self, audio: np.ndarray, sample_rate: int) -> None:
+        if not self.audio_debug_window.is_visible:
+            return
         payload = (audio.astype(np.float32), int(sample_rate))
         try:
             self.debug_audio_queue.put_nowait(payload)
@@ -1510,7 +1521,7 @@ class TeleprompterDesktopApp:
             self.audio_debug_window.update_audio(audio, sample_rate, gate_peak, gate_rms)
 
         if self.root.winfo_exists():
-            self.root.after(120, self.process_debug_audio_queue)
+            self.root.after(220, self.process_debug_audio_queue)
 
     def _sync_teleprompter_from_editor(self, _event=None) -> None:
         self.render_teleprompter("")
