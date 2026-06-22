@@ -1,9 +1,9 @@
 # AI PROMPTER
 
-[![Release](https://img.shields.io/github/v/tag/qorbals8165-tech/voice-active-prompter?label=release)](https://github.com/qorbals8165-tech/voice-active-prompter/tags)
+[![Release](https://img.shields.io/github/v/tag/qorbals8165-tech/AP-project?label=release)](https://github.com/qorbals8165-tech/AP-project/tags)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-18%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-1f6feb)](https://github.com/qorbals8165-tech/voice-active-prompter)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-1f6feb)](https://github.com/qorbals8165-tech/AP-project)
 
 > 이전 이름은 **Voice Active Prompter** 입니다. 앱 표시 이름은 **AI PROMPTER**로 변경되었습니다.
 

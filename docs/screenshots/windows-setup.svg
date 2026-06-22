@@ -8,7 +8,7 @@
   <rect width="1200" height="700" fill="url(#bg)"/>
   <rect x="70" y="60" width="1060" height="580" rx="14" fill="#0a0f1a" stroke="#2d3b56" stroke-width="2"/>
   <text x="100" y="110" fill="#c5d4f2" font-size="28" font-family="Consolas, 'Courier New', monospace">Windows Initial Setup</text>
-  <text x="100" y="155" fill="#9fb3d9" font-size="22" font-family="Consolas, 'Courier New', monospace">C:\voice-active-prompter&gt; setup_windows.bat</text>
+  <text x="100" y="155" fill="#9fb3d9" font-size="22" font-family="Consolas, 'Courier New', monospace">C:\AP-project&gt; setup_windows.bat</text>
   <text x="100" y="205" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[1/7] project folders check...</text>
   <text x="100" y="240" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[2/7] python check...</text>
   <text x="100" y="275" fill="#9fb3d9" font-size="20" font-family="Consolas, 'Courier New', monospace">[3/7] npm check...</text>
