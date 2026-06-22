@@ -1,5 +1,5 @@
-"""실행: backend 디렉터리에서 ``python -m app`` → 데스크톱 텔레프롬프터 창."""
+"""독립 실행: python -m app  →  pywebview 창 / python -m app --desktop  →  Tkinter 창"""
 
-from .desktop import run
+from .launcher import main
 
-run()
+main()

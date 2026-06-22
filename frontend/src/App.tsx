@@ -1,5 +1,16 @@
-import { ChangeEvent, CSSProperties, useEffect, useMemo, useRef, useState } from "react";
-import { estimateProgress, fetchDefaults, fetchHealth, transcribeAudio } from "./api";
+import { ChangeEvent, CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  fetchAudioDevices,
+  fetchDefaults,
+  fetchHealth,
+  fetchRecognitionState,
+  fetchSystemFonts,
+  importDocument,
+  startRecognition,
+  stopRecognition,
+  updateRecognitionScript,
+  type AudioDevice,
+} from "./api";
 import {
   buildLineRanges,
   firstNonEmptyFrom,
@@ -22,12 +33,19 @@ const THEMES: Record<ThemeName, { label: string; className: string }> = {
   paper: { label: "Paper", className: "theme-paper" },
 };
 
+// UI/본문 기본 글꼴 — 가독성 좋은 표준 시스템 폰트
+const DEFAULT_FONT = "system-ui, -apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Segoe UI', sans-serif";
+const PAPERLOGY_FONT = "'Paperlogy', sans-serif";
+
+// 인식 텍스트가 현재 줄과 매칭된 뒤 다음 줄로 넘기기까지의 지연(ms)
+const ADVANCE_DELAY_MS = 700;
+
+const POLL_MS = 150;
+
 export default function App() {
+  const [mode, setMode] = useState<"edit" | "present">("edit");
   const [script, setScript] = useState(DEFAULT_SCRIPT);
-  const [recognizedText, setRecognizedText] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [isAutoScroll, setIsAutoScroll] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [error, setError] = useState("");
   const [currentLineIndex, setCurrentLineIndex] = useState(0);
@@ -38,43 +56,66 @@ export default function App() {
     scrollSpeed: 28,
     contentWidth: 900,
     theme: "studio",
-    fontFamily: "'IBM Plex Sans KR', sans-serif",
+    fontFamily: DEFAULT_FONT,
+    fontWeight: 400,
+    textColor: "#ffffff",
+    bgColor: "#1b1410",
   });
+  const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
+  const [selectedDeviceIndex, setSelectedDeviceIndex] = useState<number | null>(null);
+  const [inputLevel, setInputLevel] = useState(0);
+  const [peakLevel, setPeakLevel] = useState(0);
+  const [isContinuousMode, setIsContinuousMode] = useState(false);
+  const [recognizedText, setRecognizedText] = useState("");
+  const [importStatus, setImportStatus] = useState("");
+  const [isImporting, setIsImporting] = useState(false);
+  const [localFonts, setLocalFonts] = useState<string[]>([]);
 
+  const modeRef = useRef<"edit" | "present">("edit");
   const teleprompterRef = useRef<HTMLDivElement | null>(null);
   const lineRefs = useRef<(HTMLParagraphElement | null)[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const [isRecording, setIsRecording] = useState(false);
+  const peakTimerRef = useRef<number>(0);
+  const pollTimerRef = useRef<number>(0);
+  const lastSeqRef = useRef<number>(0);
+  const linesRef = useRef<string[]>([]);
+  const currentLineIndexRef = useRef(0);
+  const autoLineAdvanceRef = useRef(autoLineAdvance);
+  const advanceTimerRef = useRef<number>(0);
 
   const lines = useMemo(() => script.split(/\r?\n/), [script]);
+
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { linesRef.current = lines; }, [lines]);
+  useEffect(() => { currentLineIndexRef.current = currentLineIndex; }, [currentLineIndex]);
+  useEffect(() => { autoLineAdvanceRef.current = autoLineAdvance; }, [autoLineAdvance]);
+
+  // ── 장치 목록 (네이티브, 권한 팝업 없음) ─────────────────────────────────
+
+  const loadDevices = useCallback(async () => {
+    try {
+      const devs = await fetchAudioDevices();
+      setAudioDevices(devs);
+      setSelectedDeviceIndex((prev) => {
+        if (prev !== null && devs.some((d) => d.index === prev)) return prev;
+        const def = devs.find((d) => d.default) ?? devs[0];
+        return def ? def.index : null;
+      });
+    } catch {
+      // 무시
+    }
+  }, []);
 
   useEffect(() => {
     setCurrentLineIndex(firstNonEmptyLineIndex(lines));
   }, [script]);
 
   useEffect(() => {
-    void fetchDefaults()
-      .then(setSettings)
-      .catch(() => undefined);
-
-    void fetchHealth()
-      .then(setHealth)
-      .catch(() => undefined);
-  }, []);
-
-  useEffect(() => {
-    if (!isAutoScroll || !teleprompterRef.current) {
-      return;
-    }
-
-    const node = teleprompterRef.current;
-    const timer = window.setInterval(() => {
-      node.scrollBy({ top: settings.scrollSpeed / 4, behavior: "smooth" });
-    }, 250);
-
-    return () => window.clearInterval(timer);
-  }, [isAutoScroll, settings.scrollSpeed]);
+    // 테마는 studio로 고정
+    void fetchDefaults().then((s) => setSettings({ ...s, theme: "studio" })).catch(() => undefined);
+    void fetchHealth().then(setHealth).catch(() => undefined);
+    void loadDevices();
+    void loadSystemFonts(); // 설치된 폰트를 미리 불러와 글꼴 목록 채움
+  }, [loadDevices]);
 
   useEffect(() => {
     const el = lineRefs.current[currentLineIndex];
@@ -88,390 +129,511 @@ export default function App() {
     return { readable, currentNum };
   }, [lines, currentLineIndex]);
 
-  async function syncFromAudioFile(file: File) {
-    setError("");
-    setIsSyncing(true);
+  // ── 줄 진행 ────────────────────────────────────────────────────────────
 
-    try {
-      const text = await transcribeAudio(file);
-      setRecognizedText(text);
+  function advanceLineFromTranscript(text: string) {
+    if (!autoLineAdvanceRef.current) return;
+    if (advanceTimerRef.current) return; // 이미 넘김이 예약됨
+    const ls = linesRef.current;
+    const cur = currentLineIndexRef.current;
+    // 빈 줄에서는 음성으로 넘기지 않음 — 방향키(↓)로만 다음 줄 이동
+    if (!ls[cur] || ls[cur].trim().length === 0) return;
+    if (!lineMatchesSpoken(ls[cur], text)) return;
+    // 매칭되면 살짝 지연 후 바로 다음 줄로 (빈 줄도 멈춤 지점이 됨)
+    advanceTimerRef.current = window.setTimeout(() => {
+      advanceTimerRef.current = 0;
+      setCurrentLineIndex((prev) => Math.min(prev + 1, linesRef.current.length - 1));
+    }, ADVANCE_DELAY_MS);
+  }
 
-      const progress = await estimateProgress(script, text);
-      const linesNow = script.split(/\r?\n/);
-      const ranges = buildLineRanges(script);
+  // 현재 줄 + 다음 줄을 Whisper 힌트로 사용
+  function currentHint(): string {
+    const ls = linesRef.current;
+    const li = firstNonEmptyFrom(ls, currentLineIndexRef.current);
+    const next = nextNonEmptyLineIndex(ls, li);
+    return [ls[li], ls[next]].filter(Boolean).join(" ");
+  }
 
-      if (teleprompterRef.current) {
-        teleprompterRef.current.scrollTo({
-          top: Math.max(progress.matched_index * 0.8, 0),
-          behavior: "smooth",
+  // ── 폴링 (레벨 + 인식 텍스트) ────────────────────────────────────────────
+
+  const startPolling = useCallback(() => {
+    if (pollTimerRef.current) return;
+    pollTimerRef.current = window.setInterval(async () => {
+      try {
+        const st = await fetchRecognitionState();
+        setInputLevel(st.level);
+        setPeakLevel((prev) => {
+          if (st.level > prev) {
+            clearTimeout(peakTimerRef.current);
+            peakTimerRef.current = window.setTimeout(() => setPeakLevel(0), 1500);
+            return st.level;
+          }
+          return prev;
         });
+        if (st.seq !== lastSeqRef.current) {
+          lastSeqRef.current = st.seq;
+          if (st.text) {
+            setRecognizedText(st.text);
+            advanceLineFromTranscript(st.text);
+          }
+        }
+      } catch {
+        // 폴링 실패 무시
       }
+    }, POLL_MS);
+  }, []);
 
-      if (!autoLineAdvance) {
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = 0;
+    }
+    if (advanceTimerRef.current) {
+      clearTimeout(advanceTimerRef.current);
+      advanceTimerRef.current = 0;
+    }
+    clearTimeout(peakTimerRef.current);
+    setInputLevel(0);
+    setPeakLevel(0);
+  }, []);
+
+  // 발표 모드 인식 ON/OFF 토글 (실제 시작·중지는 아래 effect가 담당)
+  function toggleContinuousMode() {
+    setIsContinuousMode((v) => !v);
+  }
+
+  // ── 단일 인식 라이프사이클 ────────────────────────────────────────────────
+  // 편집(레벨만)·발표(전사) 두 경우를 하나의 effect로 관리한다. start/stop을
+  // 서로 다른 effect가 동시에 호출하면 경쟁(race)으로 인식이 즉시 꺼질 수 있어,
+  // 항상 "원하는 상태"를 단일 호출로 적용한다.
+  useEffect(() => {
+    if (selectedDeviceIndex === null) return;
+    const transcribe = mode === "present" && isContinuousMode;
+    const active = mode === "edit" || transcribe;
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!active) {
+          stopPolling();
+          await stopRecognition().catch(() => undefined);
+          return;
+        }
+        lastSeqRef.current = 0;
+        setError("");
+        // startRecognition은 백엔드에서 기존 스트림을 멈추고 새로 시작(원자적)
+        await startRecognition(selectedDeviceIndex, { transcribe, script: currentHint() });
+        if (cancelled) return;
+        startPolling();
+      } catch (err) {
+        if (transcribe) {
+          setError(err instanceof Error ? err.message : "마이크를 시작할 수 없습니다.");
+          setIsContinuousMode(false);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, isContinuousMode, selectedDeviceIndex]);
+
+  // 언마운트 시 인식 정리
+  useEffect(() => {
+    return () => {
+      stopPolling();
+      void stopRecognition().catch(() => undefined);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 연속 인식 중 줄이 바뀌면 힌트 갱신
+  useEffect(() => {
+    if (mode === "present" && isContinuousMode) void updateRecognitionScript(currentHint());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentLineIndex, isContinuousMode, mode]);
+
+  // ── 문서 가져오기 ────────────────────────────────────────────────────────
+
+  async function handleDocumentImport(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setIsImporting(true);
+    setImportStatus("불러오는 중…");
+    try {
+      const text = await importDocument(file);
+      setScript(text);
+      const lineCount = text.split("\n").filter((l) => l.trim()).length;
+      setImportStatus(`✓ ${file.name} (${lineCount}줄)`);
+      setTimeout(() => setImportStatus(""), 5000);
+    } catch (err) {
+      setImportStatus(`오류: ${err instanceof Error ? err.message : "알 수 없는 오류"}`);
+    } finally {
+      setIsImporting(false);
+      event.target.value = "";
+    }
+  }
+
+  // ── 글꼴 (시스템 폰트) ────────────────────────────────────────────────────
+
+  // 백엔드가 OS 폰트 폴더를 스캔해 설치된 폰트 패밀리명을 돌려준다.
+  // (브라우저 Local Font Access API와 달리 macOS WKWebView에서도 동작)
+  async function loadSystemFonts() {
+    try {
+      const families = await fetchSystemFonts();
+      if (families.length === 0) {
+        setError("설치된 폰트를 찾지 못했습니다.");
         return;
       }
-
-      setCurrentLineIndex((prev) => {
-        let li = firstNonEmptyFrom(linesNow, prev);
-        if (li >= linesNow.length) {
-          return prev;
-        }
-
-        const lineText = linesNow[li];
-        if (lineMatchesSpoken(lineText, text)) {
-          return nextNonEmptyLineIndex(linesNow, li);
-        }
-
-        const progressLine = lineIndexForCharIndex(ranges, progress.matched_index);
-        const minConfidence = 0.28;
-        if (progress.confidence >= minConfidence && progressLine > li) {
-          const jump = firstNonEmptyFrom(linesNow, progressLine);
-          return jump < linesNow.length ? jump : prev;
-        }
-
-        return prev;
-      });
-    } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : "Audio sync failed");
-    } finally {
-      setIsSyncing(false);
-    }
-  }
-
-  async function handleAudioUpload(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
-
-    await syncFromAudioFile(file);
-    event.target.value = "";
-  }
-
-  async function startRecording() {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("이 브라우저는 마이크 입력을 지원하지 않습니다.");
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      chunksRef.current = [];
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        const file = new File([blob], "live-recording.webm", { type: "audio/webm" });
-        stream.getTracks().forEach((track) => track.stop());
-        void syncFromAudioFile(file);
-      };
-
-      recorder.start();
-      mediaRecorderRef.current = recorder;
-      setIsRecording(true);
+      setLocalFonts(families);
       setError("");
-    } catch (recordError) {
-      setError(recordError instanceof Error ? recordError.message : "마이크를 시작할 수 없습니다.");
+    } catch {
+      setError("PC 폰트 목록을 불러오지 못했습니다.");
     }
   }
 
-  function stopRecording() {
-    mediaRecorderRef.current?.stop();
-    mediaRecorderRef.current = null;
-    setIsRecording(false);
-  }
+  // ── 키워드 점프 ────────────────────────────────────────────────────────────
 
   function jumpToKeyword() {
-    if (!keyword.trim() || !teleprompterRef.current) {
-      return;
-    }
-
+    if (!keyword.trim()) return;
     const index = script.toLowerCase().indexOf(keyword.trim().toLowerCase());
-    if (index < 0) {
-      setError("키워드를 찾지 못했습니다.");
-      return;
-    }
-
+    if (index < 0) { setError("키워드를 찾지 못했습니다."); return; }
     setError("");
     const ranges = buildLineRanges(script);
-    const lineIdx = lineIndexForCharIndex(ranges, index);
-    setCurrentLineIndex(lineIdx);
-    teleprompterRef.current.scrollTo({
-      top: index * 0.8,
-      behavior: "smooth",
-    });
+    setCurrentLineIndex(lineIndexForCharIndex(ranges, index));
   }
 
-  function goToPreviousLine() {
-    setCurrentLineIndex((prev) => {
-      for (let i = prev - 1; i >= 0; i--) {
-        if (lines[i].trim().length > 0) {
-          return i;
-        }
-      }
-      return prev;
-    });
+  // ── 방향키 네비게이션 ────────────────────────────────────────────────────
+
+  const goToPreviousLine = useCallback(() => {
+    setCurrentLineIndex((prev) => Math.max(0, prev - 1));
+  }, []);
+
+  const goToNextLineManual = useCallback(() => {
+    setCurrentLineIndex((prev) => Math.min(linesRef.current.length - 1, prev + 1));
+  }, []);
+
+  // 화면 전환 — 인식 시작·중지는 mode/isContinuousMode effect가 담당
+  function goToEdit() {
+    setMode("edit");
   }
 
-  function goToNextLineManual() {
-    setCurrentLineIndex((prev) => nextNonEmptyLineIndex(lines, prev));
+  function goToPresent() {
+    setIsContinuousMode(true); // 발표 진입 시 음성 인식 자동 활성화
+    setMode("present");
   }
 
-  return (
-    <div className={`app-shell ${THEMES[settings.theme].className}`}>
-      <aside className="control-panel">
-        <div className="hero-card">
-          <p className="eyebrow">AI Teleprompter</p>
-          <h1>Voice Active Prompter</h1>
-          <p className="hero-copy">
-            Whisper 기반 음성 인식으로 현재 줄을 읽으면 자동으로 다음 줄로 넘어갑니다. 백엔드가
-            켜져 있어야 합니다.
-          </p>
-        </div>
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (modeRef.current !== "present") return;
+      const target = e.target as HTMLElement;
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); goToNextLineManual(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); goToPreviousLine(); }
+      else if (e.key === " ") { e.preventDefault(); void toggleContinuousMode(); }
+      else if (e.key === "Escape") { e.preventDefault(); goToEdit(); }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [goToNextLineManual, goToPreviousLine]);
 
-        <section className="panel-section">
-          <label className="field-label" htmlFor="script">
-            Script
-          </label>
-          <textarea
-            id="script"
-            className="script-input"
-            value={script}
-            onChange={(event) => setScript(event.target.value)}
-          />
-        </section>
+  // ── 텔레프롬프터 라인 렌더링 ──────────────────────────────────────────────
 
-        <section className="panel-section">
-          <label className="field-label" htmlFor="audio">
-            Audio Upload
-          </label>
-          <input id="audio" type="file" accept="audio/*" onChange={handleAudioUpload} />
-          <div className="recording-row">
-            <button
-              className={isRecording ? "toggle-button active" : "toggle-button"}
-              onClick={isRecording ? stopRecording : startRecording}
-            >
-              {isRecording ? "Stop Mic Sync" : "Start Mic Sync"}
-            </button>
-          </div>
-          <div className="status-line">
-            <span>{isSyncing ? "Transcribing..." : "Ready for sync"}</span>
-            <span>{isRecording ? "Mic recording live" : "Mic idle"}</span>
-            <span>{health ? `Device: ${health.device}` : "Backend offline"}</span>
-          </div>
-          <div className="line-advance-row">
-            <button
-              className={autoLineAdvance ? "toggle-button active small" : "toggle-button small"}
-              type="button"
-              onClick={() => setAutoLineAdvance((v) => !v)}
-            >
-              {autoLineAdvance ? "줄 자동 진행 켜짐" : "줄 자동 진행 꺼짐"}
-            </button>
-            <span className="line-counter">
-              줄 {lineStats.currentNum} / {lineStats.readable || "—"}
-            </span>
-          </div>
-          <p className="hint-text">
-            한 줄을 읽은 뒤 녹음을 멈추면 전사가 되고, 현재 줄과 맞으면 다음 줄로 이동합니다.
-          </p>
-          <div className="line-nav-row">
-            <button type="button" className="ghost-button" onClick={goToPreviousLine}>
-              이전 줄
-            </button>
-            <button type="button" className="ghost-button" onClick={goToNextLineManual}>
-              다음 줄
-            </button>
-          </div>
-        </section>
+  const prompterLines = lines.map((line, index) => {
+    const trimmed = line.trim().length > 0;
+    const isCurrent = index === currentLineIndex;
+    const isPast = trimmed && index < currentLineIndex;
+    const distance = Math.abs(index - currentLineIndex);
+    const distStr = trimmed && !isCurrent ? ` dist-${Math.min(distance, 5)}` : "";
+    const lineClass = isCurrent
+      ? trimmed
+        ? "prompter-line line-current"
+        : "prompter-line line-empty line-current"
+      : !trimmed
+        ? "prompter-line line-empty"
+        : isPast
+          ? `prompter-line line-done${distStr}`
+          : `prompter-line line-upcoming${distStr}`;
+    return (
+      <p
+        key={`line-${index}`}
+        ref={(el) => { lineRefs.current[index] = el; }}
+        className={lineClass}
+      >
+        {line || " "}
+      </p>
+    );
+  });
 
-        <section className="panel-section">
-          <label className="field-label" htmlFor="recognized">
-            Recognized Text
-          </label>
-          <textarea
-            id="recognized"
-            className="recognized-input"
-            value={recognizedText}
-            onChange={(event) => setRecognizedText(event.target.value)}
-          />
-        </section>
+  // VU 미터 (가로, 24 세그먼트)
+  function renderVuMeter() {
+    const SEGS = 24;
+    const peakIdx = Math.min(SEGS - 1, Math.max(0, Math.ceil((peakLevel / 100) * SEGS) - 1));
+    return (
+      <div className="vu-h">
+        {Array.from({ length: SEGS }, (_, i) => {
+          const lit = inputLevel > (i / SEGS) * 100;
+          const isPeak = i === peakIdx && !lit && peakLevel > 0;
+          const color = i >= 20 ? "vu-r" : i >= 15 ? "vu-y" : "vu-g";
+          return (
+            <div key={i} className={`vu-seg ${color}${lit ? " lit" : ""}${isPeak ? " peak" : ""}`} />
+          );
+        })}
+      </div>
+    );
+  }
 
-        <section className="panel-section inline-controls">
-          <div>
-            <label className="field-label" htmlFor="keyword">
-              Keyword Jump
-            </label>
-            <input
-              id="keyword"
-              className="text-field"
-              value={keyword}
-              onChange={(event) => setKeyword(event.target.value)}
-              placeholder="예: GPU 가속"
-            />
-          </div>
-          <button className="action-button" onClick={jumpToKeyword}>
-            Jump
-          </button>
-        </section>
+  // ── 발표 화면 ────────────────────────────────────────────────────────────
 
-        <section className="panel-section">
-          <div className="field-label">Display Settings</div>
-
-          <label className="slider-row">
-            <span>Font Size</span>
-            <input
-              type="range"
-              min="24"
-              max="72"
-              value={settings.fontSize}
-              onChange={(event) =>
-                setSettings((current) => ({
-                  ...current,
-                  fontSize: Number(event.target.value),
-                }))
-              }
-            />
-          </label>
-
-          <label className="slider-row">
-            <span>Line Height</span>
-            <input
-              type="range"
-              min="1.2"
-              max="2.1"
-              step="0.05"
-              value={settings.lineHeight}
-              onChange={(event) =>
-                setSettings((current) => ({
-                  ...current,
-                  lineHeight: Number(event.target.value),
-                }))
-              }
-            />
-          </label>
-
-          <label className="slider-row">
-            <span>Scroll Speed</span>
-            <input
-              type="range"
-              min="8"
-              max="80"
-              value={settings.scrollSpeed}
-              onChange={(event) =>
-                setSettings((current) => ({
-                  ...current,
-                  scrollSpeed: Number(event.target.value),
-                }))
-              }
-            />
-          </label>
-
-          <label className="slider-row">
-            <span>Content Width</span>
-            <input
-              type="range"
-              min="640"
-              max="1100"
-              step="10"
-              value={settings.contentWidth}
-              onChange={(event) =>
-                setSettings((current) => ({
-                  ...current,
-                  contentWidth: Number(event.target.value),
-                }))
-              }
-            />
-          </label>
-
-          <div className="theme-row">
-            {(Object.keys(THEMES) as ThemeName[]).map((themeName) => (
-              <button
-                key={themeName}
-                className={themeName === settings.theme ? "theme-pill active" : "theme-pill"}
-                onClick={() =>
-                  setSettings((current) => ({
-                    ...current,
-                    theme: themeName,
-                  }))
-                }
-              >
-                {THEMES[themeName].label}
-              </button>
-            ))}
-          </div>
-
-          <button
-            className={isAutoScroll ? "toggle-button active" : "toggle-button"}
-            onClick={() => setIsAutoScroll((current) => !current)}
-          >
-            {isAutoScroll ? "Auto Scroll On" : "Auto Scroll Off"}
-          </button>
-        </section>
-
-        {error ? <p className="error-text">{error}</p> : null}
-      </aside>
-
-      <main className="display-stage">
-        <div className="stage-header">
-          <div>
-            <p className="eyebrow">Live Display</p>
-            <h2>실시간 텔레프롬프터</h2>
-          </div>
-          <div className="telemetry">
-            <span>{health ? `Model: ${health.model_size}` : "Model: unknown"}</span>
-            <span>{recognizedText ? "Speech synced" : "Waiting for speech"}</span>
-          </div>
-        </div>
-
+  if (mode === "present") {
+    return (
+      <div
+        className={`app-shell ${THEMES[settings.theme].className}`}
+        style={{ background: settings.bgColor }}
+      >
         <div
           ref={teleprompterRef}
-          className="teleprompter-frame"
+          className="teleprompter-view"
           style={
             {
               "--font-size": `${settings.fontSize}px`,
               "--line-height": String(settings.lineHeight),
               "--content-width": `${settings.contentWidth}px`,
               "--font-family": settings.fontFamily,
+              "--font-weight": String(settings.fontWeight),
+              "--text-color": settings.textColor,
             } as CSSProperties
           }
         >
           <div className="teleprompter-gradient top" />
-          <div className="teleprompter-content">
-            {lines.map((line, index) => {
-              const trimmed = line.trim().length > 0;
-              const isCurrent = index === currentLineIndex && trimmed;
-              const isPast = trimmed && index < currentLineIndex;
-              const lineClass = !trimmed
-                ? "prompter-line line-empty"
-                : isCurrent
-                  ? "prompter-line line-current"
-                  : isPast
-                    ? "prompter-line line-done"
-                    : "prompter-line line-upcoming";
-
-              return (
-                <p
-                  key={`line-${index}`}
-                  ref={(el) => {
-                    lineRefs.current[index] = el;
-                  }}
-                  className={lineClass}
-                >
-                  {line || " "}
-                </p>
-              );
-            })}
-          </div>
-          <div className="read-guide" />
+          <div className="teleprompter-content">{prompterLines}</div>
           <div className="teleprompter-gradient bottom" />
         </div>
-      </main>
+
+        {isContinuousMode && (
+          <div className="level-bar-overlay">
+            <div className="level-bar-fill" style={{ width: `${inputLevel}%` }} />
+          </div>
+        )}
+
+        <div className="present-hud">
+          <div className="hud-left">
+            <button className="hud-back-btn" onClick={goToEdit} title="편집 화면으로 돌아가기 (Esc)">
+              ← 편집
+            </button>
+            <span className="hud-line-counter">
+              {lineStats.currentNum} / {lineStats.readable || "—"}
+            </span>
+            {isContinuousMode
+              ? <span className="hud-mode">🎙 인식 중 (Space로 끄기)</span>
+              : <span className="hud-mode hud-off">⏸ 인식 꺼짐 (Space로 켜기)</span>}
+            {error && <span className="hud-error">{error}</span>}
+          </div>
+        </div>
+
+        {/* 인식된 텍스트 미리보기 (디버그/확인용) */}
+        {isContinuousMode && recognizedText && (
+          <div className="recognized-overlay">{recognizedText}</div>
+        )}
+      </div>
+    );
+  }
+
+  // ── 편집 화면 ────────────────────────────────────────────────────────────
+
+  return (
+    <div className={`edit-shell ${THEMES[settings.theme].className}`}>
+      <header className="edit-header">
+        <h1 className="edit-app-title">🎙 AI PROMPTER</h1>
+        <div className="edit-header-actions">
+          <label
+            htmlFor="doc-import"
+            className={`import-btn${isImporting ? " loading" : ""}`}
+            title=".docx · .hwp · .txt 파일을 스크립트로 가져옵니다"
+          >
+            {isImporting ? "불러오는 중…" : "📄 파일 가져오기"}
+          </label>
+          <input
+            id="doc-import"
+            type="file"
+            accept=".docx,.hwp,.txt,.md"
+            style={{ display: "none" }}
+            onChange={handleDocumentImport}
+            disabled={isImporting}
+          />
+          <button className="btn-present" onClick={goToPresent}>
+            ▶ 발표 시작
+          </button>
+        </div>
+      </header>
+
+      <div className="edit-body">
+        {/* 왼쪽: 스크립트 편집 */}
+        <div className="edit-col-script">
+          <div className="edit-col-label">스크립트</div>
+          {importStatus && <p className="import-status">{importStatus}</p>}
+          <textarea
+            className="script-input edit-script-textarea"
+            style={{
+              fontFamily: settings.fontFamily,
+              fontWeight: settings.fontWeight,
+              fontSize: `${settings.fontSize}px`,
+              lineHeight: settings.lineHeight,
+              color: settings.textColor,
+              background: settings.bgColor,
+            }}
+            value={script}
+            onChange={(e) => setScript(e.target.value)}
+            placeholder="여기에 스크립트를 입력하거나 파일을 가져오세요…"
+          />
+        </div>
+
+        {/* 오른쪽: 설정 패널 */}
+        <div className="edit-col-settings">
+          {/* 마이크 */}
+          <div className="edit-section">
+            <label className="field-label">마이크</label>
+            <div className="device-select-row">
+              <select
+                className="device-select"
+                value={selectedDeviceIndex ?? ""}
+                onChange={(e) => setSelectedDeviceIndex(e.target.value === "" ? null : Number(e.target.value))}
+              >
+                {audioDevices.length === 0 ? (
+                  <option value="">마이크를 찾을 수 없음</option>
+                ) : (
+                  audioDevices.map((d) => (
+                    <option key={d.index} value={d.index}>
+                      {d.name}{d.default ? " (기본)" : ""}
+                    </option>
+                  ))
+                )}
+              </select>
+              <button type="button" className="ghost-button" onClick={() => void loadDevices()}>
+                새로고침
+              </button>
+            </div>
+            <div className="mic-test-row">
+              <span className="mic-level-label">입력 레벨</span>
+              {renderVuMeter()}
+            </div>
+            <div className="status-line">
+              <span>
+                {health
+                  ? health.device ? `디바이스: ${health.device}` : "백엔드 온라인"
+                  : "백엔드 오프라인"}
+              </span>
+            </div>
+          </div>
+
+          {/* 시작 위치 */}
+          <div className="edit-section">
+            <div className="field-label">시작 위치</div>
+            <div className="keyword-row">
+              <input
+                className="text-field"
+                value={keyword}
+                onChange={(e) => setKeyword(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && jumpToKeyword()}
+                placeholder="키워드로 검색…"
+              />
+              <button className="action-button" onClick={jumpToKeyword}>이동</button>
+            </div>
+            <div className="line-advance-row" style={{ marginTop: 10 }}>
+              <button
+                className={`toggle-button small${autoLineAdvance ? " active" : ""}`}
+                type="button"
+                onClick={() => setAutoLineAdvance((v) => !v)}
+              >
+                {autoLineAdvance ? "자동 진행 켜짐" : "자동 진행 꺼짐"}
+              </button>
+              <span className="line-counter">
+                {lineStats.currentNum} / {lineStats.readable || "—"} 줄
+              </span>
+            </div>
+          </div>
+
+          {/* 화면 설정 */}
+          <div className="edit-section">
+            <div className="field-label">화면 설정</div>
+            <label className="slider-row">
+              <span>글자 크기</span>
+              <input
+                type="range" min="24" max="72" value={settings.fontSize}
+                onChange={(e) => setSettings((s) => ({ ...s, fontSize: Number(e.target.value) }))}
+              />
+              <span className="slider-value">{settings.fontSize}px</span>
+            </label>
+            <label className="slider-row">
+              <span>줄 간격</span>
+              <input
+                type="range" min="1.2" max="2.1" step="0.05" value={settings.lineHeight}
+                onChange={(e) => setSettings((s) => ({ ...s, lineHeight: Number(e.target.value) }))}
+              />
+            </label>
+            <label className="slider-row">
+              <span>텍스트 폭</span>
+              <input
+                type="range" min="640" max="1200" step="10" value={settings.contentWidth}
+                onChange={(e) => setSettings((s) => ({ ...s, contentWidth: Number(e.target.value) }))}
+              />
+            </label>
+            <div className="font-row">
+              <span>글꼴</span>
+              <select
+                className="device-select"
+                value={settings.fontFamily}
+                onChange={(e) => setSettings((s) => ({ ...s, fontFamily: e.target.value }))}
+              >
+                <optgroup label="기본">
+                  <option value={DEFAULT_FONT}>기본 (시스템 글꼴)</option>
+                  <option value={PAPERLOGY_FONT}>Paperlogy</option>
+                </optgroup>
+                {localFonts.length > 0 && (
+                  <optgroup label="설치된 폰트">
+                    {localFonts.map((f) => (
+                      <option key={f} value={`'${f}', sans-serif`}>{f}</option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+            </div>
+            <div className="font-row">
+              <span>굵기</span>
+              <select
+                className="device-select"
+                value={settings.fontWeight}
+                onChange={(e) => setSettings((s) => ({ ...s, fontWeight: Number(e.target.value) }))}
+              >
+                <option value={300}>가늘게</option>
+                <option value={400}>보통</option>
+                <option value={500}>중간</option>
+                <option value={600}>약간 굵게</option>
+                <option value={700}>굵게</option>
+                <option value={800}>매우 굵게</option>
+              </select>
+            </div>
+            <div className="font-row">
+              <span>글자 색</span>
+              <input
+                type="color"
+                className="color-input"
+                value={settings.textColor}
+                onChange={(e) => setSettings((s) => ({ ...s, textColor: e.target.value }))}
+              />
+            </div>
+            <div className="font-row">
+              <span>배경 색</span>
+              <input
+                type="color"
+                className="color-input"
+                value={settings.bgColor}
+                onChange={(e) => setSettings((s) => ({ ...s, bgColor: e.target.value }))}
+              />
+            </div>
+          </div>
+
+          {error && <p className="error-text">{error}</p>}
+        </div>
+      </div>
     </div>
   );
 }

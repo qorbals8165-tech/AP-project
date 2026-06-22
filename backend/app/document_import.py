@@ -16,13 +16,8 @@ def extract_text_from_path(path: Path) -> str:
             "구형 Word(.doc)은 지원하지 않습니다. Word에서 .docx로 저장하거나 "
             "Google 문서는 '파일 → 다운로드 → Microsoft Word(.docx)'로 내보내 주세요."
         )
-    if suffix in (".docx", ".docs"):
-        try:
-            return _text_from_docx(path)
-        except Exception:
-            if suffix == ".docs":
-                return _read_plain_text(path)
-            raise
+    if suffix == ".docx":
+        return _text_from_docx(path)
     if suffix == ".hwp":
         return _text_from_hwp(path)
     raise ValueError(f"지원하지 않는 형식입니다: {suffix}")

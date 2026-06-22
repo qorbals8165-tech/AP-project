@@ -26,8 +26,8 @@ sips -z 512 512 "$SRC" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
 sips -z 512 512 "$SRC" --out "$ICONSET/icon_512x512.png" >/dev/null
 sips -z 1024 1024 "$SRC" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
 
-APP_RESOURCES="$ROOT/Voice Active Prompter.app/Contents/Resources"
-mkdir -p "$APP_RESOURCES"
-iconutil -c icns "$ICONSET" -o "$APP_RESOURCES/AppIcon.icns"
+# PyInstaller 스펙(aiprompter.spec)이 읽는 위치에 바로 생성
+OUT="$ROOT/backend/assets/app_icon.icns"
+iconutil -c icns "$ICONSET" -o "$OUT"
 rm -rf "$ICONSET"
-echo "Created $APP_RESOURCES/AppIcon.icns"
+echo "Created $OUT"

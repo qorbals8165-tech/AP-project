@@ -1,73 +1,49 @@
 #!/usr/bin/env python3
-"""1024px 앱 아이콘 PNG 생성 (Voice Active Prompter)."""
+"""마스터 아이콘 이미지에서 파생 아이콘(PNG/ICO)을 생성.
+
+마스터 소스: backend/assets/Icon.png (없으면 app_icon_1024.png)
+생성물:
+  - app_icon_1024.png  (1024² 마스터 — macOS .icns iconset 소스)
+  - app_icon.png       (256²  — 데스크톱 창 런타임 아이콘)
+  - app_icon.ico       (다중 크기 — Windows 실행 파일 아이콘)
+
+macOS .icns 는 scripts/build_macos_icns.sh 가 app_icon_1024.png 로 생성한다.
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
-SIZE = 1024
+ASSETS = Path(__file__).resolve().parents[1] / "backend" / "assets"
+MASTER_CANDIDATES = ("Icon.png", "app_icon_1024.png")
+ICO_SIZES = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 
-def render_icon() -> Image.Image:
-    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    rr = int(SIZE * 0.224)
-    draw.rounded_rectangle((0, 0, SIZE - 1, SIZE - 1), radius=rr, fill=(22, 24, 30, 255))
-
-    # 오렌지 그라데이션 느낌 (동심원)
-    cx, cy = SIZE // 2, int(SIZE * 0.42)
-    for i in range(12):
-        r = int(SIZE * (0.32 - i * 0.015))
-        t = i / 11.0
-        r_col = int(240 - t * 40)
-        g_col = int(110 - t * 30)
-        b_col = int(45 - t * 15)
-        a = 255 - i * 10
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(r_col, g_col, b_col, min(a, 255)))
-
-    # 텔레프롬프터 줄
-    left = int(SIZE * 0.18)
-    right = int(SIZE * 0.82)
-    gap = int(SIZE * 0.055)
-    y0 = int(SIZE * 0.58)
-    bar_h = int(SIZE * 0.045)
-    for i in range(4):
-        y = y0 + i * gap
-        w = right - left - i * int(SIZE * 0.04)
-        draw.rounded_rectangle(
-            (left, y, left + w, y + bar_h),
-            radius=bar_h // 2,
-            fill=(245, 242, 236, 235),
-        )
-
-    # 마이크 실루엣 (하단)
-    mx = SIZE // 2
-    my = int(SIZE * 0.28)
-    mw = int(SIZE * 0.12)
-    mh = int(SIZE * 0.16)
-    draw.rounded_rectangle((mx - mw // 2, my - mh, mx + mw // 2, my + mh // 3), radius=mw // 2, fill=(18, 20, 26, 255))
-    stem_w = int(SIZE * 0.028)
-    stem_h = int(SIZE * 0.06)
-    draw.rounded_rectangle(
-        (mx - stem_w // 2, my + mh // 3, mx + stem_w // 2, my + mh // 3 + stem_h),
-        radius=stem_w // 2,
-        fill=(18, 20, 26, 255),
+def _load_master() -> Image.Image:
+    for name in MASTER_CANDIDATES:
+        path = ASSETS / name
+        if path.exists():
+            return Image.open(path).convert("RGBA")
+    raise SystemExit(
+        f"마스터 아이콘이 없습니다. {ASSETS} 에 "
+        f"{' 또는 '.join(MASTER_CANDIDATES)} 를 넣어주세요."
     )
 
-    return img
+
+def _resized(img: Image.Image, size: int) -> Image.Image:
+    return img.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def main() -> None:
-    root = Path(__file__).resolve().parents[1]
-    assets = root / "backend" / "assets"
-    assets.mkdir(parents=True, exist_ok=True)
-    im = render_icon()
-    master = assets / "app_icon_1024.png"
-    im.save(master, "PNG")
-    small = im.resize((256, 256), Image.Resampling.LANCZOS)
-    small.save(assets / "app_icon.png", "PNG")
-    print(f"Wrote {master} and {assets / 'app_icon.png'}")
+    ASSETS.mkdir(parents=True, exist_ok=True)
+    master = _load_master()
+
+    _resized(master, 1024).save(ASSETS / "app_icon_1024.png", "PNG")
+    _resized(master, 256).save(ASSETS / "app_icon.png", "PNG")
+    master.save(ASSETS / "app_icon.ico", sizes=ICO_SIZES)
+
+    print(f"Wrote app_icon_1024.png, app_icon.png, app_icon.ico → {ASSETS}")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,9 @@ export interface UiSettings {
   contentWidth: number;
   theme: ThemeName;
   fontFamily: string;
+  fontWeight: number;
+  textColor: string;
+  bgColor: string;
 }
 
 export interface ProgressResponse {
@@ -17,6 +20,6 @@ export interface ProgressResponse {
 
 export interface HealthResponse {
   status: string;
-  model_size: string;
-  device: string;
+  model_size?: string;
+  device?: string;
 }

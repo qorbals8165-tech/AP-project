@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 import tempfile
 import time
@@ -7,18 +8,18 @@ from collections import deque
 from pathlib import Path
 from threading import Lock
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .core import find_best_match, get_runtime_device, get_runtime_model_name, transcribe_audio_file
 from .settings import get_csv_env
 from .schemas import ProgressRequest, ProgressResponse, SettingsResponse
 
+ALLOWED_DOC_SUFFIXES = {".txt", ".md", ".docx", ".hwp"}
+
 
 APP_TITLE = "Voice Active Prompter API"
-MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
-MODEL_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
 CORS_ORIGINS = get_csv_env(
     "BACKEND_CORS_ORIGINS",
     ["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -64,7 +65,7 @@ def verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="API key is required but not configured",
         )
-    if x_api_key != API_KEY:
+    if x_api_key is None or not hmac.compare_digest(x_api_key, API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
@@ -119,7 +120,7 @@ def default_settings(
         scroll_speed=28.0,
         content_width=900,
         theme="studio",
-        font_family="'IBM Plex Sans KR', sans-serif",
+        font_family="system-ui, -apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Segoe UI', sans-serif",
     )
 
 
@@ -144,6 +145,7 @@ def estimate_progress(
 async def transcribe_audio(
     request: Request,
     file: UploadFile = File(...),
+    initial_prompt: str | None = Form(default=None),
     _: None = Depends(verify_api_key),
 ) -> dict[str, object]:
     enforce_rate_limit(request)
@@ -179,7 +181,7 @@ async def transcribe_audio(
             temp_file.write(chunk)
 
     try:
-        return transcribe_audio_file(temp_path)
+        return transcribe_audio_file(temp_path, initial_prompt=initial_prompt or None)
     except HTTPException:
         raise
     except Exception as exc:
@@ -187,3 +189,140 @@ async def transcribe_audio(
     finally:
         await file.close()
         temp_path.unlink(missing_ok=True)
+
+
+@app.get("/api/audio-devices")
+def audio_devices(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    enforce_rate_limit(request)
+    from .native_audio import list_input_devices
+
+    try:
+        return {"devices": list_input_devices()}
+    except Exception:
+        return {"devices": []}
+
+
+@app.get("/api/system-fonts")
+def system_fonts(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    enforce_rate_limit(request)
+    from .system_fonts import list_system_fonts
+
+    try:
+        return {"fonts": list_system_fonts()}
+    except Exception:
+        return {"fonts": []}
+
+
+@app.post("/api/recognition/start")
+async def recognition_start(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    enforce_rate_limit(request)
+    from .native_audio import controller
+
+    payload = await request.json()
+    device_index = payload.get("device_index")
+    transcribe = bool(payload.get("transcribe", True))
+    script = str(payload.get("script", ""))
+    try:
+        idx = int(device_index) if device_index is not None else None
+    except (TypeError, ValueError):
+        idx = None
+    try:
+        controller.start(idx, transcribe=transcribe, script=script)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"마이크를 시작할 수 없습니다: {exc}") from exc
+    return controller.state()
+
+
+@app.post("/api/recognition/stop")
+def recognition_stop(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    enforce_rate_limit(request)
+    from .native_audio import controller
+
+    controller.stop()
+    return controller.state()
+
+
+@app.get("/api/recognition/state")
+def recognition_state(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    from .native_audio import controller
+
+    return controller.state()
+
+
+@app.post("/api/recognition/script")
+async def recognition_script(
+    request: Request,
+    _: None = Depends(verify_api_key),
+) -> dict[str, str]:
+    from .native_audio import controller
+
+    payload = await request.json()
+    controller.set_script(str(payload.get("script", "")))
+    return {"status": "ok"}
+
+
+@app.post("/api/import-document")
+async def import_document(
+    request: Request,
+    file: UploadFile = File(...),
+    _: None = Depends(verify_api_key),
+) -> dict[str, object]:
+    enforce_rate_limit(request)
+
+    suffix = Path(file.filename or "doc.txt").suffix.lower()
+    if suffix not in ALLOWED_DOC_SUFFIXES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"지원하지 않는 형식입니다. 지원: {', '.join(sorted(ALLOWED_DOC_SUFFIXES))}",
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = Path(tmp.name)
+        total_size = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_UPLOAD_BYTES:
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"파일이 너무 큽니다 (최대 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                )
+            tmp.write(chunk)
+
+    try:
+        from .document_import import extract_text_from_path
+        text = extract_text_from_path(tmp_path)
+        return {"text": text}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="문서를 처리하지 못했습니다.") from exc
+    finally:
+        await file.close()
+        tmp_path.unlink(missing_ok=True)
+
+
+# 프로덕션 빌드(frontend/dist)가 있으면 동일 서버에서 정적 파일을 서빙
+from .paths import frontend_dist  # noqa: E402
+
+_FRONTEND_DIST = frontend_dist()
+if _FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")

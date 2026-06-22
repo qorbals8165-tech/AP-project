@@ -17,9 +17,9 @@ import soundfile as sf
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
 from .core import (
-    MODEL_SIZE,
     find_progressive_match,
     get_runtime_device,
+    get_runtime_model_name,
     transcribe_audio_file_with_options,
 )
 from .document_import import extract_text_from_path
@@ -61,8 +61,6 @@ class LiveMicTranscriber:
         chunk_seconds: float = 1.4,
         sample_rate: int = 16000,
         language: str | None = "ko",
-        beam_size: int = 3,
-        best_of: int = 3,
         gate_peak_threshold: float = 0.0025,
         gate_rms_threshold: float = 0.0007,
         initial_prompt: str | None = None,
@@ -76,8 +74,6 @@ class LiveMicTranscriber:
         self.chunk_seconds = chunk_seconds
         self.sample_rate = sample_rate
         self.language = language
-        self.beam_size = beam_size
-        self.best_of = best_of
         self.gate_peak_threshold = gate_peak_threshold
         self.gate_rms_threshold = gate_rms_threshold
         self.initial_prompt = initial_prompt
@@ -169,10 +165,6 @@ class LiveMicTranscriber:
             result = transcribe_audio_file_with_options(
                 temp_path,
                 language=self.language,
-                beam_size=self.beam_size,
-                best_of=self.best_of,
-                vad_filter=True,
-                condition_on_previous_text=True,
                 initial_prompt=self._compose_prompt(),
             )
             text = str(result["text"]).strip()
@@ -357,9 +349,21 @@ class SubtitleWindow:
     @staticmethod
     def _load_presentation_font(size: int) -> ImageFont.ImageFont:
         font_candidates = [
+            # macOS
             "/System/Library/Fonts/AppleSDGothicNeo.ttc",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            # Windows (Korean)
+            "C:/Windows/Fonts/malgun.ttf",
+            "C:/Windows/Fonts/gulim.ttc",
+            "C:/Windows/Fonts/batang.ttc",
+            "C:/Windows/Fonts/arial.ttf",
+            # Linux (Noto CJK covers Korean)
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
         ]
 
         for font_path in font_candidates:
@@ -614,8 +618,6 @@ class TeleprompterDesktopApp:
         self.input_sensitivity_var = tk.DoubleVar(value=1.8)
         self.input_sensitivity_display_var = tk.StringVar(value="")
         self.recognition_preset_var = tk.StringVar(value="균형")
-        self.accuracy_priority_var = tk.BooleanVar(value=False)
-        self.speed_priority_var = tk.BooleanVar(value=False)
         self.level_var = tk.DoubleVar(value=0.0)
         self.level_meter_segments = 18
         self.display_level = 0.0
@@ -628,13 +630,12 @@ class TeleprompterDesktopApp:
 
         self._build_ui()
         self.refresh_presentation_mirror_button()
-        self.refresh_priority_mode_buttons()
         self.refresh_input_sensitivity_display()
         self.refresh_listening_ui()
         self.apply_app_icon()
         self.apply_script(DEFAULT_SCRIPT)
         self.refresh_devices()
-        self.set_status(f"Whisper model={MODEL_SIZE}, device={get_runtime_device()}")
+        self.set_status(f"Whisper model={get_runtime_model_name()}, device={get_runtime_device()}")
         self.root.after(50, self.process_level_queue)
         self.root.after(120, self.process_debug_audio_queue)
         self._ensure_main_window_visible()
@@ -852,18 +853,6 @@ class TeleprompterDesktopApp:
             command=self.toggle_presentation_mirror_button,
         )
         self.presentation_mirror_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.accuracy_priority_button = ttk.Button(
-            button_panel,
-            text="정확도 우선: OFF",
-            command=self.toggle_accuracy_priority_button,
-        )
-        self.accuracy_priority_button.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        self.speed_priority_button = ttk.Button(
-            button_panel,
-            text="속도 우선: OFF",
-            command=self.toggle_speed_priority_button,
-        )
-        self.speed_priority_button.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
 
         sensitivity_panel = tk.Frame(button_panel, bg="#252526")
         sensitivity_panel.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -914,7 +903,7 @@ class TeleprompterDesktopApp:
         ttk.Label(script_card, text="대본 편집", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(
             script_card,
-            text="직접 입력하거나 파일을 가져와 수정할 수 있습니다. (.txt · Word .docx · 한글 .hwp)",
+            text="직접 입력하거나 파일을 가져와 수정할 수 있습니다. (.txt · Word .docx · 한글 .hwp 지원)",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1235,30 +1224,6 @@ class TeleprompterDesktopApp:
         state = "ON" if self.subtitle_mirror_var.get() else "OFF"
         self.presentation_mirror_button.configure(text=f"프레젠테이션 좌우반전: {state}")
 
-    def toggle_accuracy_priority_button(self) -> None:
-        next_value = not self.accuracy_priority_var.get()
-        self.accuracy_priority_var.set(next_value)
-        if next_value and self.speed_priority_var.get():
-            self.speed_priority_var.set(False)
-        self.apply_priority_modes()
-        self.mark_button_action(f"정확도 우선 {'ON' if next_value else 'OFF'}")
-
-    def toggle_speed_priority_button(self) -> None:
-        next_value = not self.speed_priority_var.get()
-        self.speed_priority_var.set(next_value)
-        if next_value and self.accuracy_priority_var.get():
-            self.accuracy_priority_var.set(False)
-        self.apply_priority_modes()
-        self.mark_button_action(f"속도 우선 {'ON' if next_value else 'OFF'}")
-
-    def refresh_priority_mode_buttons(self) -> None:
-        if not hasattr(self, "accuracy_priority_button") or not hasattr(self, "speed_priority_button"):
-            return
-        accuracy_state = "ON" if self.accuracy_priority_var.get() else "OFF"
-        speed_state = "ON" if self.speed_priority_var.get() else "OFF"
-        self.accuracy_priority_button.configure(text=f"정확도 우선: {accuracy_state}")
-        self.speed_priority_button.configure(text=f"속도 우선: {speed_state}")
-
     def get_gate_thresholds(self) -> tuple[float, float]:
         # Higher sensitivity lowers the gate so quieter speech passes through.
         # Base thresholds are tuned to reduce under-detection in normal room voice.
@@ -1276,26 +1241,6 @@ class TeleprompterDesktopApp:
         gate_peak, gate_rms = self.get_gate_thresholds()
         self.transcriber.gate_peak_threshold = gate_peak
         self.transcriber.gate_rms_threshold = gate_rms
-
-    def get_decoder_preferences(self) -> tuple[int, int]:
-        if self.accuracy_priority_var.get():
-            return 6, 6
-        if self.speed_priority_var.get():
-            return 1, 1
-        return 3, 3
-
-    def apply_priority_modes(self) -> None:
-        self.refresh_priority_mode_buttons()
-        beam_size, best_of = self.get_decoder_preferences()
-        if self.transcriber is not None:
-            self.transcriber.beam_size = beam_size
-            self.transcriber.best_of = best_of
-        mode = "균형"
-        if self.accuracy_priority_var.get():
-            mode = "정확도 우선"
-        elif self.speed_priority_var.get():
-            mode = "속도 우선"
-        self.set_status(f"우선 모드 적용: {mode} (beam={beam_size}, best_of={best_of})")
 
     def apply_speed_preset(self) -> None:
         self.apply_recognition_preset(
@@ -1342,7 +1287,6 @@ class TeleprompterDesktopApp:
 
         if self.transcriber is not None:
             self.transcriber.chunk_seconds = max(float(self.chunk_seconds_var.get()), 0.8)
-        self.apply_priority_modes()
 
         self.mark_button_action(f"프리셋: {name}")
         self.set_status(
@@ -1602,8 +1546,6 @@ class TeleprompterDesktopApp:
                 on_audio_snapshot=self.queue_debug_audio_update,
                 chunk_seconds=max(float(self.chunk_seconds_var.get()), 0.8),
                 language=None if self.language_var.get() == "auto" else self.language_var.get(),
-                beam_size=self.get_decoder_preferences()[0],
-                best_of=self.get_decoder_preferences()[1],
                 gate_peak_threshold=self.get_gate_thresholds()[0],
                 gate_rms_threshold=self.get_gate_thresholds()[1],
                 initial_prompt=(
@@ -1681,8 +1623,8 @@ class TeleprompterDesktopApp:
         file_path = filedialog.askopenfilename(
             title="대본 파일 가져오기",
             filetypes=[
-                ("모든 지원 형식", "*.txt *.docx *.docs *.hwp"),
-                ("Word / Google 문서", "*.docx *.docs"),
+                ("모든 지원 형식", "*.txt *.docx *.hwp"),
+                ("Word 문서", "*.docx"),
                 ("한글", "*.hwp"),
                 ("텍스트", "*.txt"),
                 ("모든 파일", "*.*"),
